@@ -1,0 +1,31 @@
+# Build artifacts
+/stockpile
+/stockpile-bench
+/analyze-games
+/build/
+*.exe
+*.tmp
+
+# Data directory (contains downloaded/processed evaluation data)
+data/
+
+# Compressed data files
+*.zst
+
+# Test coverage
+coverage.out
+coverage.html
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Benchmark results
+*.benchmark
+benchmark-results/
