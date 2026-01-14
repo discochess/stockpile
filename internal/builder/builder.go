@@ -3,6 +3,7 @@ package builder
 import (
 	"bufio"
 	"bytes"
+	"container/heap"
 	"context"
 	"fmt"
 	"io"
@@ -320,26 +321,13 @@ func (b *Builder) processRecords(ctx context.Context, reader io.Reader, shardsDi
 	return nil
 }
 
-// writeShard sorts and writes a single shard.
+// writeShard streams sorted records to a compressed shard file.
 func (b *Builder) writeShard(ctx context.Context, shardID int, collector *shardCollector) (int, error) {
-	// Get all records.
-	records, err := collector.GetAll()
-	if err != nil {
-		return 0, err
-	}
-
-	if len(records) == 0 {
+	if collector.Count() == 0 {
 		return 0, nil
 	}
 
-	// Sort by FEN.
-	sort.Slice(records, func(i, j int) bool {
-		fenI := extractFEN(records[i])
-		fenJ := extractFEN(records[j])
-		return fenI < fenJ
-	})
-
-	// Write compressed shard.
+	// Create output file with streaming zstd compression.
 	shardPath := filepath.Join(b.outputDir, "shards", fmt.Sprintf("%05d.zst", shardID))
 	file, err := os.Create(shardPath)
 	if err != nil {
@@ -353,16 +341,26 @@ func (b *Builder) writeShard(ctx context.Context, shardID int, collector *shardC
 	}
 	defer encoder.Close()
 
-	for _, record := range records {
+	// Stream sorted records from merge sort.
+	recordCh, errCh := collector.StreamSorted(ctx)
+
+	count := 0
+	for record := range recordCh {
 		if _, err := encoder.Write(record); err != nil {
 			return 0, err
 		}
 		if _, err := encoder.Write([]byte("\n")); err != nil {
 			return 0, err
 		}
+		count++
 	}
 
-	return len(records), nil
+	// Check for streaming errors.
+	if err := <-errCh; err != nil {
+		return 0, err
+	}
+
+	return count, nil
 }
 
 func (b *Builder) reportProgress(p Progress) {
@@ -378,8 +376,9 @@ type shardCollector struct {
 	records      [][]byte
 	memoryBytes  int64
 	tempDir      string
-	spilledFile  string // non-empty if spilled to disk
-	spilledCount int    // number of records spilled
+	spilledFiles []string // sorted temp files from spills
+	spilledCount int      // number of records spilled
+	spillCount   int      // number of spill operations (for unique filenames)
 	memTracker   *memoryTracker
 }
 
@@ -483,12 +482,18 @@ func (c *shardCollector) spillToDisk() error {
 		return nil
 	}
 
-	// Open temp file for append (create if doesn't exist).
-	tempFile := filepath.Join(c.tempDir, fmt.Sprintf("shard_%05d.tmp", c.shardID))
+	// Sort records by FEN before writing (for external merge sort).
+	sort.Slice(c.records, func(i, j int) bool {
+		return extractFEN(c.records[i]) < extractFEN(c.records[j])
+	})
 
-	file, err := os.OpenFile(tempFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	// Create unique temp file for this spill.
+	tempFile := filepath.Join(c.tempDir, fmt.Sprintf("shard_%05d_%d.tmp", c.shardID, c.spillCount))
+	c.spillCount++
+
+	file, err := os.Create(tempFile)
 	if err != nil {
-		return fmt.Errorf("opening temp file: %w", err)
+		return fmt.Errorf("creating temp file: %w", err)
 	}
 
 	// Write records with length prefix for reading back.
@@ -520,8 +525,8 @@ func (c *shardCollector) spillToDisk() error {
 
 	// Update tracker and free memory.
 	c.memTracker.remove(c.memoryBytes)
-	c.spilledFile = tempFile
-	c.spilledCount += len(c.records) // Accumulate across multiple spills
+	c.spilledFiles = append(c.spilledFiles, tempFile)
+	c.spilledCount += len(c.records)
 	c.records = nil
 	c.memoryBytes = 0
 
@@ -532,42 +537,189 @@ func (c *shardCollector) Count() int {
 	return len(c.records) + c.spilledCount
 }
 
-func (c *shardCollector) GetAll() ([][]byte, error) {
-	var allRecords [][]byte
+// mergeEntry represents a record from one of the sorted sources.
+type mergeEntry struct {
+	record []byte
+	fen    string
+	source int // index of the source (0=in-memory, 1+=spilled files)
+}
 
-	// Load spilled records if any.
-	if c.spilledFile != "" {
-		file, err := os.Open(c.spilledFile)
-		if err != nil {
-			return nil, fmt.Errorf("opening spilled file: %w", err)
-		}
-		defer file.Close()
+// mergeHeap is a min-heap ordered by FEN for k-way merge sort.
+type mergeHeap []mergeEntry
 
-		reader := bufio.NewReader(file)
-		for {
-			// Read 4-byte length prefix.
-			lengthBuf := make([]byte, 4)
-			if _, err := io.ReadFull(reader, lengthBuf); err != nil {
-				if err == io.EOF {
-					break
-				}
-				return nil, fmt.Errorf("reading length: %w", err)
-			}
-			length := uint32(lengthBuf[0])<<24 | uint32(lengthBuf[1])<<16 |
-				uint32(lengthBuf[2])<<8 | uint32(lengthBuf[3])
+func (h mergeHeap) Len() int           { return len(h) }
+func (h mergeHeap) Less(i, j int) bool { return h[i].fen < h[j].fen }
+func (h mergeHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *mergeHeap) Push(x any)        { *h = append(*h, x.(mergeEntry)) }
+func (h *mergeHeap) Pop() any {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[0 : n-1]
+	return x
+}
 
-			record := make([]byte, length)
-			if _, err := io.ReadFull(reader, record); err != nil {
-				return nil, fmt.Errorf("reading record: %w", err)
-			}
-			allRecords = append(allRecords, record)
-		}
+// sortedFileReader reads length-prefixed records from a sorted temp file.
+type sortedFileReader struct {
+	file   *os.File
+	reader *bufio.Reader
+}
+
+func newSortedFileReader(path string) (*sortedFileReader, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
 	}
+	return &sortedFileReader{
+		file:   file,
+		reader: bufio.NewReader(file),
+	}, nil
+}
 
-	// Append in-memory records.
-	allRecords = append(allRecords, c.records...)
+func (r *sortedFileReader) Next() ([]byte, error) {
+	// Read 4-byte length prefix.
+	lengthBuf := make([]byte, 4)
+	if _, err := io.ReadFull(r.reader, lengthBuf); err != nil {
+		return nil, err // EOF or error
+	}
+	length := uint32(lengthBuf[0])<<24 | uint32(lengthBuf[1])<<16 |
+		uint32(lengthBuf[2])<<8 | uint32(lengthBuf[3])
 
-	return allRecords, nil
+	record := make([]byte, length)
+	if _, err := io.ReadFull(r.reader, record); err != nil {
+		return nil, err
+	}
+	return record, nil
+}
+
+func (r *sortedFileReader) Close() error {
+	return r.file.Close()
+}
+
+// StreamSorted returns records in sorted order using external merge sort.
+// It yields records one at a time via channel, never loading all records into memory.
+func (c *shardCollector) StreamSorted(ctx context.Context) (<-chan []byte, <-chan error) {
+	recordCh := make(chan []byte, 100) // Buffer for smoother streaming
+	errCh := make(chan error, 1)
+
+	go func() {
+		defer close(recordCh)
+		defer close(errCh)
+
+		// Sort in-memory records.
+		sort.Slice(c.records, func(i, j int) bool {
+			return extractFEN(c.records[i]) < extractFEN(c.records[j])
+		})
+
+		// If no spilled files, just yield in-memory records.
+		if len(c.spilledFiles) == 0 {
+			for _, record := range c.records {
+				select {
+				case <-ctx.Done():
+					errCh <- ctx.Err()
+					return
+				case recordCh <- record:
+				}
+			}
+			return
+		}
+
+		// Open readers for spilled files.
+		readers := make([]*sortedFileReader, len(c.spilledFiles))
+		for i, path := range c.spilledFiles {
+			reader, err := newSortedFileReader(path)
+			if err != nil {
+				errCh <- fmt.Errorf("opening spilled file %s: %w", path, err)
+				return
+			}
+			readers[i] = reader
+			defer readers[i].Close()
+		}
+
+		// Initialize heap with first record from each source.
+		h := &mergeHeap{}
+		heap.Init(h)
+
+		// Add first in-memory record (source 0).
+		inMemIdx := 0
+		if len(c.records) > 0 {
+			heap.Push(h, mergeEntry{
+				record: c.records[0],
+				fen:    extractFEN(c.records[0]),
+				source: 0,
+			})
+			inMemIdx = 1
+		}
+
+		// Add first record from each spilled file (sources 1+).
+		for i, reader := range readers {
+			record, err := reader.Next()
+			if err == io.EOF {
+				continue
+			}
+			if err != nil {
+				errCh <- fmt.Errorf("reading from spilled file: %w", err)
+				return
+			}
+			heap.Push(h, mergeEntry{
+				record: record,
+				fen:    extractFEN(record),
+				source: i + 1, // 1-indexed for spilled files
+			})
+		}
+
+		// K-way merge.
+		for h.Len() > 0 {
+			select {
+			case <-ctx.Done():
+				errCh <- ctx.Err()
+				return
+			default:
+			}
+
+			// Pop smallest.
+			entry := heap.Pop(h).(mergeEntry)
+
+			// Yield record.
+			select {
+			case <-ctx.Done():
+				errCh <- ctx.Err()
+				return
+			case recordCh <- entry.record:
+			}
+
+			// Refill from the same source.
+			if entry.source == 0 {
+				// In-memory source.
+				if inMemIdx < len(c.records) {
+					heap.Push(h, mergeEntry{
+						record: c.records[inMemIdx],
+						fen:    extractFEN(c.records[inMemIdx]),
+						source: 0,
+					})
+					inMemIdx++
+				}
+			} else {
+				// Spilled file source.
+				reader := readers[entry.source-1]
+				record, err := reader.Next()
+				if err == io.EOF {
+					continue // This source exhausted.
+				}
+				if err != nil {
+					errCh <- fmt.Errorf("reading from spilled file: %w", err)
+					return
+				}
+				heap.Push(h, mergeEntry{
+					record: record,
+					fen:    extractFEN(record),
+					source: entry.source,
+				})
+			}
+		}
+	}()
+
+	return recordCh, errCh
 }
 
 // extractFEN extracts the FEN from a JSON line.

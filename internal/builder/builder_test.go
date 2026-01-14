@@ -63,11 +63,11 @@ func TestShardCollector(t *testing.T) {
 		t.Errorf("Count() = %d, want 0", c.Count())
 	}
 
-	// Add records.
+	// Add records (in reverse order to test sorting).
 	records := [][]byte{
+		[]byte(`{"fen":"c"}`),
 		[]byte(`{"fen":"a"}`),
 		[]byte(`{"fen":"b"}`),
-		[]byte(`{"fen":"c"}`),
 	}
 
 	for _, r := range records {
@@ -80,20 +80,31 @@ func TestShardCollector(t *testing.T) {
 		t.Errorf("Count() = %d, want 3", c.Count())
 	}
 
-	// GetAll returns all records.
-	got, err := c.GetAll()
-	if err != nil {
-		t.Fatalf("GetAll() error = %v", err)
+	// StreamSorted returns all records in sorted order.
+	ctx := context.Background()
+	recordCh, errCh := c.StreamSorted(ctx)
+
+	var got [][]byte
+	for r := range recordCh {
+		got = append(got, r)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("StreamSorted() error = %v", err)
 	}
 
 	if len(got) != 3 {
-		t.Errorf("GetAll() returned %d records, want 3", len(got))
+		t.Errorf("StreamSorted() returned %d records, want 3", len(got))
 	}
 
-	// Verify records are copies (not sharing underlying buffer).
+	// Verify records are sorted by FEN.
+	expected := [][]byte{
+		[]byte(`{"fen":"a"}`),
+		[]byte(`{"fen":"b"}`),
+		[]byte(`{"fen":"c"}`),
+	}
 	for i, r := range got {
-		if !bytes.Equal(r, records[i]) {
-			t.Errorf("record %d = %q, want %q", i, r, records[i])
+		if !bytes.Equal(r, expected[i]) {
+			t.Errorf("record %d = %q, want %q", i, r, expected[i])
 		}
 	}
 }
@@ -113,7 +124,13 @@ func TestShardCollector_CopiesData(t *testing.T) {
 	original[0] = 'X'
 
 	// Verify stored record is unchanged.
-	records, _ := c.GetAll()
+	ctx := context.Background()
+	recordCh, errCh := c.StreamSorted(ctx)
+	var records [][]byte
+	for r := range recordCh {
+		records = append(records, r)
+	}
+	<-errCh
 	if records[0][0] == 'X' {
 		t.Error("shardCollector should copy data, not store reference")
 	}
@@ -369,6 +386,7 @@ func TestShardCollector_SpillToDisk(t *testing.T) {
 	tracker.collectors = []*shardCollector{c}
 
 	// Add records that exceed the limit (each ~80 bytes + overhead).
+	// Use FENs that sort in a specific order to verify merge sort.
 	records := [][]byte{
 		[]byte(`{"fen":"rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1","evals":[]}`),
 		[]byte(`{"fen":"r1bqkbnr/pppppppp/n7/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1","evals":[]}`),
@@ -382,26 +400,40 @@ func TestShardCollector_SpillToDisk(t *testing.T) {
 	}
 
 	// With such a low limit, collector should have spilled at least once.
-	// After spilling, new records are added to memory again.
-	// So we check either spilled or total count is correct.
 	if c.Count() != 3 {
 		t.Errorf("Count() = %d, want 3", c.Count())
 	}
 
-	// GetAll should return all records (from disk + memory).
-	got, err := c.GetAll()
-	if err != nil {
-		t.Fatalf("GetAll() error = %v", err)
+	// StreamSorted should return all records (from disk + memory) in sorted order.
+	ctx := context.Background()
+	recordCh, errCh := c.StreamSorted(ctx)
+
+	var got [][]byte
+	for r := range recordCh {
+		got = append(got, r)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("StreamSorted() error = %v", err)
 	}
 
 	if len(got) != 3 {
-		t.Errorf("GetAll() returned %d records, want 3", len(got))
+		t.Errorf("StreamSorted() returned %d records, want 3", len(got))
 	}
 
-	// Verify records content is preserved.
+	// Verify records content is preserved and sorted.
 	for i, r := range got {
 		if !bytes.Contains(r, []byte(`"fen":`)) {
 			t.Errorf("record %d doesn't contain expected content", i)
+		}
+	}
+
+	// Verify sorted order (8/8/... < r1bq... < rnbq...).
+	if len(got) == 3 {
+		fen0 := extractFEN(got[0])
+		fen1 := extractFEN(got[1])
+		fen2 := extractFEN(got[2])
+		if fen0 >= fen1 || fen1 >= fen2 {
+			t.Errorf("records not sorted: %q, %q, %q", fen0, fen1, fen2)
 		}
 	}
 }
@@ -441,10 +473,10 @@ func TestMemoryTracker_SpillsLargest(t *testing.T) {
 	}
 
 	// c1 should be spilled (it had more memory).
-	if c1.spilledFile == "" {
+	if len(c1.spilledFiles) == 0 {
 		t.Error("expected c1 to be spilled")
 	}
-	if c2.spilledFile != "" {
+	if len(c2.spilledFiles) != 0 {
 		t.Error("c2 should not be spilled")
 	}
 }
