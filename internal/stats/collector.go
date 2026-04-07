@@ -13,6 +13,10 @@ const (
 	MetricCacheHits   = "stockpile_cache_hits_total"
 	MetricCacheMisses = "stockpile_cache_misses_total"
 	MetricCacheSize   = "stockpile_cache_size"
+
+	// Disk cache metrics.
+	MetricDiskCacheHits   = "stockpile_disk_cache_hits_total"
+	MetricDiskCacheMisses = "stockpile_disk_cache_misses_total"
 )
 
 // Collector defines the interface for collecting metrics.

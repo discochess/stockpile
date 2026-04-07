@@ -12,9 +12,11 @@ import (
 	"github.com/discochess/stockpile/internal/codec/zstdcodec"
 	"github.com/discochess/stockpile/internal/stats"
 	"github.com/discochess/stockpile/internal/stats/logger"
+	"github.com/discochess/stockpile/internal/store"
 	"github.com/discochess/stockpile/internal/store/cachedstore"
 	"github.com/discochess/stockpile/internal/store/cachedstore/cachestrategy/lru"
 	"github.com/discochess/stockpile/internal/store/cachedstore/memory"
+	"github.com/discochess/stockpile/internal/store/diskcache"
 	"github.com/discochess/stockpile/internal/store/gcsstore"
 )
 
@@ -29,6 +31,12 @@ type Config struct {
 	// CacheSize is the number of shards to cache in memory.
 	// Default is 100.
 	CacheSize int
+
+	// CacheDir is an optional directory for on-disk shard caching.
+	// When set, shards fetched from GCS are cached on disk so that
+	// subsequent reads are served from the local filesystem.
+	// If empty, no disk caching is performed.
+	CacheDir string
 }
 
 // Module provides a GCS-backed stockpile client.
@@ -76,9 +84,22 @@ func newClient(p Params) (Result, error) {
 		gcsOpts = append(gcsOpts, gcsstore.WithPrefix(p.Config.Prefix))
 	}
 
-	baseStore, err := gcsstore.New(ctx, p.Config.Bucket, zstdcodec.New(), gcsOpts...)
+	gcsStore, err := gcsstore.New(ctx, p.Config.Bucket, zstdcodec.New(), gcsOpts...)
 	if err != nil {
 		return Result{}, err
+	}
+
+	// Build the store chain: gcsstore -> optional diskcache -> in-memory LRU.
+	var baseStore store.Store = gcsStore
+	if p.Config.CacheDir != "" {
+		dc, err := diskcache.New(gcsStore, p.Config.CacheDir, zstdcodec.New(),
+			diskcache.WithStats(p.Collector),
+			diskcache.WithLogger(p.Logger.Named("stockpile.diskcache")),
+		)
+		if err != nil {
+			return Result{}, err
+		}
+		baseStore = dc
 	}
 
 	lruStrategy, err := lru.New(cacheSize)
