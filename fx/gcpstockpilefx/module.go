@@ -28,8 +28,8 @@ type Config struct {
 	// Prefix is an optional key prefix for all objects.
 	Prefix string
 
-	// CacheSize is the number of shards to cache in memory.
-	// Default is 100.
+	// CacheSize is the number of decompressed shards to cache in memory.
+	// When 0 (the default), no in-memory caching is performed.
 	CacheSize int
 
 	// CacheDir is an optional directory for on-disk shard caching.
@@ -70,11 +70,6 @@ type Result struct {
 }
 
 func newClient(p Params) (Result, error) {
-	cacheSize := p.Config.CacheSize
-	if cacheSize <= 0 {
-		cacheSize = 100
-	}
-
 	// Use a timeout context for GCS client initialization.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -89,8 +84,8 @@ func newClient(p Params) (Result, error) {
 		return Result{}, err
 	}
 
-	// Build the store chain: gcsstore -> optional diskcache -> in-memory LRU.
-	var baseStore store.Store = gcsStore
+	// Build the store chain: gcsstore -> optional diskcache -> optional in-memory LRU.
+	var st store.Store = gcsStore
 	if p.Config.CacheDir != "" {
 		dc, err := diskcache.New(gcsStore, p.Config.CacheDir, zstdcodec.New(),
 			diskcache.WithStats(p.Collector),
@@ -99,15 +94,16 @@ func newClient(p Params) (Result, error) {
 		if err != nil {
 			return Result{}, err
 		}
-		baseStore = dc
+		st = dc
 	}
 
-	lruStrategy, err := lru.New(cacheSize)
-	if err != nil {
-		return Result{}, err
+	if p.Config.CacheSize > 0 {
+		lruStrategy, err := lru.New(p.Config.CacheSize)
+		if err != nil {
+			return Result{}, err
+		}
+		st = cachedstore.New(st, memory.New(lruStrategy, p.Collector))
 	}
-
-	st := cachedstore.New(baseStore, memory.New(lruStrategy, p.Collector))
 
 	client, err := stockpile.New(
 		stockpile.WithStore(st),

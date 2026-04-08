@@ -11,6 +11,7 @@ import (
 	"github.com/discochess/stockpile/internal/codec/zstdcodec"
 	"github.com/discochess/stockpile/internal/stats"
 	"github.com/discochess/stockpile/internal/stats/logger"
+	"github.com/discochess/stockpile/internal/store"
 	"github.com/discochess/stockpile/internal/store/cachedstore"
 	"github.com/discochess/stockpile/internal/store/cachedstore/cachestrategy/lru"
 	"github.com/discochess/stockpile/internal/store/cachedstore/memory"
@@ -22,8 +23,8 @@ type Config struct {
 	// DataDir is the directory containing the stockpile data.
 	DataDir string
 
-	// CacheSize is the number of shards to cache in memory.
-	// Default is 100.
+	// CacheSize is the number of decompressed shards to cache in memory.
+	// When 0 (the default), no in-memory caching is performed.
 	CacheSize int
 }
 
@@ -58,22 +59,19 @@ type Result struct {
 }
 
 func newClient(p Params) (Result, error) {
-	cacheSize := p.Config.CacheSize
-	if cacheSize <= 0 {
-		cacheSize = 100
-	}
-
 	baseStore, err := diskstore.New(p.Config.DataDir, zstdcodec.New())
 	if err != nil {
 		return Result{}, err
 	}
 
-	lruStrategy, err := lru.New(cacheSize)
-	if err != nil {
-		return Result{}, err
+	var st store.Store = baseStore
+	if p.Config.CacheSize > 0 {
+		lruStrategy, err := lru.New(p.Config.CacheSize)
+		if err != nil {
+			return Result{}, err
+		}
+		st = cachedstore.New(st, memory.New(lruStrategy, p.Collector))
 	}
-
-	st := cachedstore.New(baseStore, memory.New(lruStrategy, p.Collector))
 
 	client, err := stockpile.New(
 		stockpile.WithStore(st),
